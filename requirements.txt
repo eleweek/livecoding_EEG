@@ -1,0 +1,7 @@
+flask
+flask-cors
+matplotlib
+mne
+mne-lsl
+numpy
+pygame
