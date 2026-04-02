@@ -18,4 +18,4 @@ def filter_and_drop_dead_channels(raw, picks, to_drop=None, avgref=False):
     if avgref:
         raw.set_eeg_reference('average', projection=False)
 
-    raw.pick(picks)
+    raw.pick(picks) 

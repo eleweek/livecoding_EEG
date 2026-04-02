@@ -1,4 +1,6 @@
 import time
+import json
+import asyncio
 import argparse
 import threading
 from io import BytesIO
@@ -6,6 +8,7 @@ from io import BytesIO
 import numpy as np
 import mne
 import pygame
+import websockets
 from flask import Flask, jsonify, send_file, Response
 from flask_cors import CORS
 import matplotlib
@@ -22,6 +25,8 @@ from libs.plot import plot_to_pygame
 latest_filtered_data = None
 latest_raw_data = None
 latest_info = {}
+new_samples_count = 0
+trim_seconds = 3
 data_lock = threading.Lock()
 
 app = Flask(__name__)
@@ -89,13 +94,12 @@ def get_filtered_data():
         sampling_rate = latest_info.get('sampling_rate', 0)
 
         # Calculate samples to slice away (2 seconds on each end)
-        samples_per_second = int(sampling_rate)
+        trim = int(sampling_rate * trim_seconds)
         n_samples_total = latest_filtered_data.shape[1]
 
-        # Only slice if we have more than 4 seconds of data
-        if n_samples_total > 4 * samples_per_second:
-            start_idx = 2 * samples_per_second
-            end_idx = n_samples_total - 2 * samples_per_second
+        if n_samples_total > 2 * trim:
+            start_idx = trim
+            end_idx = n_samples_total - trim
             sliced_data = latest_filtered_data[:, start_idx:end_idx]
         else:
             sliced_data = latest_filtered_data
@@ -137,14 +141,12 @@ def get_raw_data():
         all_channels = latest_info.get('channels', [])
         sampling_rate = latest_info.get('sampling_rate', 0)
 
-        # Calculate samples to slice away (2 seconds on each end, matching filtered data)
-        samples_per_second = int(sampling_rate)
+        trim = int(sampling_rate * trim_seconds)
         n_samples_total = latest_raw_data.shape[1]
 
-        # Only slice if we have more than 4 seconds of data
-        if n_samples_total > 4 * samples_per_second:
-            start_idx = 2 * samples_per_second
-            end_idx = n_samples_total - 2 * samples_per_second
+        if n_samples_total > 2 * trim:
+            start_idx = trim
+            end_idx = n_samples_total - trim
             sliced_data = latest_raw_data[:, start_idx:end_idx]
         else:
             sliced_data = latest_raw_data
@@ -221,7 +223,7 @@ def get_status():
 
 def data_collection_thread(scale_factor, picks, max_seconds, pull_interval):
     """Background thread for collecting and filtering EEG data"""
-    global latest_filtered_data, latest_raw_data, latest_info
+    global latest_filtered_data, latest_raw_data, latest_info, new_samples_count
 
     # Resolve and connect to LSL stream
     streams = resolve_streams()
@@ -291,10 +293,48 @@ def data_collection_thread(scale_factor, picks, max_seconds, pull_interval):
                 latest_raw_data = raw_data_transposed
                 latest_info['channels'] = raw.ch_names
                 latest_info['n_channels'] = len(raw.ch_names)
+                new_samples_count += len(data)
 
             print(f"Updated data: {filtered_data.shape}")
 
         time.sleep(pull_interval)
+
+ws_clients = set()
+
+async def ws_handler(websocket):
+    ws_clients.add(websocket)
+    try:
+        async for _ in websocket:
+            pass
+    finally:
+        ws_clients.discard(websocket)
+
+async def ws_broadcast(interval):
+    while True:
+        if ws_clients:
+            with data_lock:
+                if latest_filtered_data is not None:
+                    channels = latest_info.get('channels', [])
+                    sr = latest_info.get('sampling_rate', 0)
+                    trim = int(sr * trim_seconds)
+                    n = latest_filtered_data.shape[1]
+                    if n > 2 * trim:
+                        sliced = latest_filtered_data[:, trim:n - trim]
+                    else:
+                        sliced = latest_filtered_data
+                    msg = json.dumps({
+                        'data': {ch: sliced[i].tolist() for i, ch in enumerate(channels)},
+                        'sampling_rate': sr,
+                    })
+            if latest_filtered_data is not None:
+                websockets.broadcast(ws_clients, msg)
+        await asyncio.sleep(interval)
+
+def ws_server_thread(host, port, interval):
+    async def run():
+        async with websockets.serve(ws_handler, host, port):
+            await ws_broadcast(interval)
+    asyncio.run(run())
 
 def flask_server_thread(host, port):
     """Run Flask server in a background thread"""
@@ -309,13 +349,18 @@ def main():
     parser.add_argument('--convert-uv', action='store_true', help='Convert uV to V')
     parser.add_argument('--picks', type=str, default=None, help='Comma or space-separated list of channels to use')
     parser.add_argument('--port', type=int, default=5000, help='HTTP port (default: 5000)')
+    parser.add_argument('--ws-port', type=int, default=5001, help='WebSocket port (default: 5001)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
     parser.add_argument('--max-seconds', type=int, default=20, help='Maximum seconds of data to keep in buffer')
     parser.add_argument('--pull-interval', type=float, default=0.02, help='Interval in seconds between LSL data pulls (default: 0.3)')
+    parser.add_argument('--trim-seconds', type=float, default=3, help='Seconds to trim from each end to remove filter ringing (default: 3)')
 
     args = parser.parse_args()
     picks = parse_picks(args.picks)
     scale_factor = 1e-6 if args.convert_uv else 1.0
+
+    global trim_seconds
+    trim_seconds = args.trim_seconds
 
     # Start data collection thread
     collection_thread = threading.Thread(
@@ -333,7 +378,16 @@ def main():
     )
     server_thread.start()
 
+    # Start WebSocket server in background thread
+    ws_thread = threading.Thread(
+        target=ws_server_thread,
+        args=(args.host, args.ws_port, args.pull_interval),
+        daemon=True
+    )
+    ws_thread.start()
+
     print(f"\nStarting HTTP server on {args.host}:{args.port}")
+    print(f"Starting WebSocket server on {args.host}:{args.ws_port}")
     print("\nAvailable endpoints:")
     print(f"  - http://{args.host}:{args.port}/status - Get stream status")
     print(f"  - http://{args.host}:{args.port}/data/filtered - Get filtered EEG data (JSON)")
