@@ -11,6 +11,7 @@ import pygame
 import websockets
 from flask import Flask, jsonify, send_file, Response
 from flask_cors import CORS
+from pythonosc.udp_client import SimpleUDPClient
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -336,6 +337,29 @@ def ws_server_thread(host, port, interval):
             await ws_broadcast(interval)
     asyncio.run(run())
 
+def osc_sender_thread(host, port, interval):
+    """Send per-channel latest EEG values as OSC messages to TouchDesigner"""
+    broadcast = host.endswith('.255') or host == '255.255.255.255'
+    client = SimpleUDPClient(host, port, allow_broadcast=broadcast)
+    print(f"OSC sender → {host}:{port}{' (broadcast)' if broadcast else ''}")
+    while True:
+        with data_lock:
+            if latest_filtered_data is not None:
+                channels = latest_info.get('channels', [])
+                sr = latest_info.get('sampling_rate', 0)
+                trim = int(sr * trim_seconds)
+                n = latest_filtered_data.shape[1]
+                end = n - trim if n > 2 * trim else n
+                # Latest sample per channel
+                snapshot = [(ch, float(latest_filtered_data[i, end - 1]))
+                            for i, ch in enumerate(channels)
+                            if end > 0]
+            else:
+                snapshot = []
+        for ch, val in snapshot:
+            client.send_message(f"/eeg/{ch}", val)
+        time.sleep(interval)
+
 def flask_server_thread(host, port):
     """Run Flask server in a background thread"""
     app.run(host=host, port=port, threaded=True)
@@ -354,6 +378,9 @@ def main():
     parser.add_argument('--max-seconds', type=int, default=20, help='Maximum seconds of data to keep in buffer')
     parser.add_argument('--pull-interval', type=float, default=0.02, help='Interval in seconds between LSL data pulls (default: 0.3)')
     parser.add_argument('--trim-seconds', type=float, default=3, help='Seconds to trim from each end to remove filter ringing (default: 3)')
+    parser.add_argument('--osc-host', type=str, default=None, help='OSC target host (e.g. 127.0.0.1). If unset, OSC is disabled.')
+    parser.add_argument('--osc-port', type=int, default=7000, help='OSC target port (default: 7000, TouchDesigner default)')
+    parser.add_argument('--osc-interval', type=float, default=0.02, help='Interval in seconds between OSC sends (default: 0.02 = 50Hz)')
 
     args = parser.parse_args()
     picks = parse_picks(args.picks)
@@ -385,6 +412,14 @@ def main():
         daemon=True
     )
     ws_thread.start()
+
+    if args.osc_host:
+        osc_thread = threading.Thread(
+            target=osc_sender_thread,
+            args=(args.osc_host, args.osc_port, args.osc_interval),
+            daemon=True
+        )
+        osc_thread.start()
 
     print(f"\nStarting HTTP server on {args.host}:{args.port}")
     print(f"Starting WebSocket server on {args.host}:{args.ws_port}")

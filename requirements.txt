@@ -5,4 +5,5 @@ mne
 mne-lsl
 numpy
 pygame
+python-osc
 websockets
