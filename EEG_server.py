@@ -342,6 +342,10 @@ def osc_sender_thread(host, port, interval):
     broadcast = host.endswith('.255') or host == '255.255.255.255'
     client = SimpleUDPClient(host, port, allow_broadcast=broadcast)
     print(f"OSC sender → {host}:{port}{' (broadcast)' if broadcast else ''}")
+    msg_count = 0
+    send_count = 0
+    skip_count = 0
+    last_report = time.time()
     while True:
         with data_lock:
             if latest_filtered_data is not None:
@@ -356,8 +360,28 @@ def osc_sender_thread(host, port, interval):
                             if end > 0]
             else:
                 snapshot = []
-        for ch, val in snapshot:
-            client.send_message(f"/eeg/{ch}", val)
+        if snapshot:
+            try:
+                for ch, val in snapshot:
+                    client.send_message(f"/eeg/{ch}", val)
+                send_count += 1
+                msg_count += len(snapshot)
+                preview = ", ".join(f"{ch}={val:+.4g}" for ch, val in snapshot[:4])
+                more = f" (+{len(snapshot) - 4} more)" if len(snapshot) > 4 else ""
+                print(f"[OSC] → {host}:{port} {len(snapshot)} msgs | {preview}{more}")
+            except Exception as e:
+                print(f"[OSC] send error: {e!r}")
+        else:
+            skip_count += 1
+            print(f"[OSC] skip — no data yet (skip_count={skip_count})")
+        now = time.time()
+        if now - last_report >= 5.0:
+            elapsed = now - last_report
+            print(f"[OSC] stats: {send_count} sends ({send_count/elapsed:.1f}/s), "
+                  f"{msg_count} msgs ({msg_count/elapsed:.1f}/s), "
+                  f"{skip_count} skips over last {elapsed:.1f}s")
+            msg_count = send_count = skip_count = 0
+            last_report = now
         time.sleep(interval)
 
 def flask_server_thread(host, port):
